@@ -37,7 +37,8 @@ PRESET_URLS: dict[str, str] = {
     "2": ("LM Studio", "http://127.0.0.1:1234/v1"),
     "3": ("Jan", "http://localhost:1337/v1"),
     "4": ("vLLM (default port)", "http://localhost:8000/v1"),
-    "5": ("Custom", ""),
+    "5": ("llama.cpp (default port)", "http://localhost:8080/v1"),
+    "6": ("Custom", ""),
 }
 
 CONNECT_TIMEOUT = 5  # seconds
