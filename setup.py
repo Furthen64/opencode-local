@@ -1,287 +1,397 @@
 #!/usr/bin/env python3
-"""
-opencode-local setup utility
-Interactively generates ~/.config/opencode/opencode.json and
-~/.local/share/opencode/auth.json for a locally-hosted OpenAI-compatible LLM.
-
-Requirements: Python 3.11+, no third-party libraries.
-Platform: Ubuntu / Linux
-"""
-
+"""Configure OpenCode providers without owning credentials or secrets."""
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
-import shutil
 import socket
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-OPENCODE_CONFIG_DIR = Path.home() / ".config" / "opencode"
-OPENCODE_DATA_DIR = Path.home() / ".local" / "share" / "opencode"
-CONFIG_PATH = OPENCODE_CONFIG_DIR / "opencode.json"
-AUTH_PATH = OPENCODE_DATA_DIR / "auth.json"
-
+CONFIG_DIR = Path(os.environ.get("OPENCODE_LOCAL_CONFIG_DIR", Path.home() / ".config" / "opencode"))
+CONFIG_PATH = CONFIG_DIR / "opencode.json"
+METADATA_PATH = CONFIG_DIR / "opencode-local.json"
 SCHEMA_URL = "https://opencode.ai/config.json"
-
-PRESET_URLS: dict[str, str] = {
+VERSION = 1
+LOCAL_FREE, REMOTE_PAID = "local-free", "remote-paid"
+PRESETS = {
     "1": ("Ollama", "http://localhost:11434/v1"),
     "2": ("LM Studio", "http://127.0.0.1:1234/v1"),
     "3": ("Jan", "http://localhost:1337/v1"),
-    "4": ("vLLM (default port)", "http://localhost:8000/v1"),
-    "5": ("llama.cpp (default port)", "http://localhost:8080/v1"),
+    "4": ("vLLM", "http://localhost:8000/v1"),
+    "5": ("llama.cpp", "http://localhost:8080/v1"),
     "6": ("Custom", ""),
 }
 
-CONNECT_TIMEOUT = 5  # seconds
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _print_banner() -> None:
-    print(
-        "\n"
-        "╔══════════════════════════════════════════════════════╗\n"
-        "║         opencode-local — quick setup wizard          ║\n"
-        "╚══════════════════════════════════════════════════════╝\n"
-        "\n"
-        "This wizard will:\n"
-        "  1. Ask a few questions about your local LLM server\n"
-        "  2. Fetch the list of available models from that server\n"
-        "  3. Back up your existing opencode config (if any)\n"
-        "  4. Write a new opencode.json and auth.json\n"
-    )
-
-
-def _prompt(message: str, default: str = "") -> str:
-    """Prompt the user, returning the default if they press Enter."""
-    suffix = f" [{default}]" if default else ""
+def prompt(message: str, default: str = "") -> str:
     try:
-        value = input(f"{message}{suffix}: ").strip()
+        value = input(f"{message}{f' [{default}]' if default else ''}: ").strip()
     except (EOFError, KeyboardInterrupt):
-        print("\nAborted.")
-        sys.exit(1)
-    return value if value else default
+        sys.exit("\nAborted.")
+    return value or default
 
 
-def _prompt_secret(message: str, default: str = "") -> str:
-    """Prompt for a potentially sensitive value (no masking needed — local key)."""
-    return _prompt(message, default)
+def read(path: Path, default: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not path.exists():
+        return dict(default or {})
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(result, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return result
 
 
-def _choose_base_url() -> str:
-    """Ask the user to pick a preset or enter a custom URL."""
-    print("Choose your local LLM server:")
-    for key, (name, url) in PRESET_URLS.items():
-        suffix = f"  ({url})" if url else ""
-        print(f"  {key}) {name}{suffix}")
-    print()
-
-    while True:
-        choice = _prompt("Enter number or type a URL directly", "1").strip()
-        if choice in PRESET_URLS:
-            _, url = PRESET_URLS[choice]
-            if url:
-                return url
-            # Custom
-            return _prompt("Enter the base URL (include /v1)", "http://localhost:8080/v1")
-        # User typed a URL directly
-        if choice.startswith("http://") or choice.startswith("https://"):
-            return choice.rstrip("/")
-        print("  Please enter a number from the list or a full URL starting with http(s)://")
-
-
-def _fetch_models(base_url: str, api_key: str) -> list[str]:
-    """
-    Try to fetch the model list from <base_url>/models.
-    Returns a (possibly empty) list of model IDs on success.
-    Raises urllib.error.URLError / OSError on connection failure.
-    """
-    url = f"{base_url.rstrip('/')}/models"
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=CONNECT_TIMEOUT) as resp:
-        body = resp.read().decode()
-    data = json.loads(body)
-    # OpenAI /v1/models returns {"object":"list","data":[{"id":...},...]}.
-    # Some servers omit the envelope.
-    if isinstance(data, list):
-        models = data
-    else:
-        models = data.get("data", [])
-    return sorted(item.get("id", "") for item in models if item.get("id"))
-
-
-def _select_model(models: list[str]) -> str:
-    """Let the user pick a model from a numbered list or type one manually."""
-    if models:
-        print(f"\nFound {len(models)} model(s) on the server:")
-        for idx, m in enumerate(models, 1):
-            print(f"  {idx}) {m}")
-        print()
-        while True:
-            choice = _prompt(
-                "Pick a model number or type the model name", "1" if models else ""
-            )
-            if choice.isdigit():
-                idx = int(choice)
-                if 1 <= idx <= len(models):
-                    return models[idx - 1]
-                print(f"  Please enter a number between 1 and {len(models)}.")
-            elif choice:
-                return choice
-    else:
-        return _prompt("No models found — enter the model name manually", "")
-
-
-def _backup_config() -> None:
-    """Backup existing opencode.json with a timestamp suffix."""
-    if not CONFIG_PATH.exists():
-        return
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = CONFIG_PATH.with_suffix(f".{ts}.bak")
-    shutil.copy2(CONFIG_PATH, backup)
-    print(f"  Backed up existing config → {backup}")
-
-
-def _slugify(text: str) -> str:
-    """Turn an arbitrary string into a simple identifier (lowercase, hyphens)."""
-    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return slug or "localllm"
-
-
-def _build_opencode_json(
-    provider_id: str,
-    provider_name: str,
-    base_url: str,
-    model_id: str,
-) -> dict:
-    return {
-        "$schema": SCHEMA_URL,
-        "provider": {
-            provider_id: {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": provider_name,
-                "options": {
-                    "baseURL": base_url,
-                },
-                "models": {
-                    model_id: {"name": model_id},
-                },
-            }
-        },
-        "model": f"{provider_id}/{model_id}",
-        "small_model": f"{provider_id}/{model_id}",
-    }
-
-
-def _build_auth_json(existing: dict, provider_id: str, api_key: str) -> dict:
-    updated = dict(existing)
-    updated[provider_id] = {"type": "api", "key": api_key}
-    return updated
-
-
-def _write_json(path: Path, data: dict) -> None:
+def write(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-        fh.write("\n")
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-# ---------------------------------------------------------------------------
-# Main flow
-# ---------------------------------------------------------------------------
+def metadata() -> dict[str, Any]:
+    data = read(METADATA_PATH, {"version": VERSION, "providers": {}})
+    if data.get("version") != VERSION or not isinstance(data.get("providers"), dict):
+        raise ValueError(f"Unsupported or invalid metadata in {METADATA_PATH}")
+    return data
+
+
+def provider_meta(data: dict[str, Any], provider_id: str) -> dict[str, Any]:
+    item = data["providers"].setdefault(provider_id, {})
+    item.setdefault("availability", "enabled")
+    item.setdefault("models", {})
+    return item
+
+
+def model_meta(data: dict[str, Any], provider_id: str, model_id: str) -> dict[str, Any]:
+    item = provider_meta(data, provider_id)["models"].setdefault(model_id, {})
+    item.setdefault("availability", "enabled")
+    return item
+
+
+def credential_status(provider: dict[str, Any]) -> tuple[str, str | None]:
+    credential = provider.get("credential", {})
+    if not credential.get("required", False):
+        return "NOT REQUIRED", None
+    variable = credential.get("environment_variable")
+    return ("PRESENT" if variable and os.environ.get(variable) else "MISSING", variable)
+
+
+def validate_classification(value: str) -> str:
+    aliases = {"local": LOCAL_FREE, "free": LOCAL_FREE, "remote": REMOTE_PAID, "paid": REMOTE_PAID}
+    value = aliases.get(value.lower(), value.lower())
+    if value not in {LOCAL_FREE, REMOTE_PAID}:
+        raise ValueError("classification must be local-free or remote-paid")
+    return value
+
+
+def set_credential_reference(config_provider: dict[str, Any], item: dict[str, Any], variable: str | None) -> None:
+    """Store only an OpenCode environment placeholder, never a credential."""
+    options = config_provider.setdefault("options", {})
+    prior = item.get("applied_api_key_reference")
+    if variable:
+        options["apiKey"] = f"{{env:{variable}}}"
+        item["credential"] = {"required": True, "source": "environment", "environment_variable": variable}
+        item["applied_api_key_reference"] = variable
+    else:
+        if prior and options.get("apiKey") == f"{{env:{prior}}}":
+            options.pop("apiKey")
+        if not options:
+            config_provider.pop("options", None)
+        item["credential"] = {"required": False}
+        item.pop("applied_api_key_reference", None)
+
+
+def adopt(data: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Adopt existing definitions; do not infer cost or credential requirements."""
+    changed = False
+    for provider_id, provider in config.get("provider", {}).items():
+        if not isinstance(provider, dict):
+            continue
+        if provider_id not in data["providers"]:
+            provider_meta(data, provider_id)
+            changed = True
+        item = provider_meta(data, provider_id)
+        if "display_name" not in item and provider.get("name"):
+            item["display_name"] = provider["name"]
+            changed = True
+        for model_id in provider.get("models", {}):
+            if model_id not in item["models"]:
+                model_meta(data, provider_id, model_id)
+                changed = True
+    return changed
+
+
+def sync() -> None:
+    """Apply metadata with documented OpenCode blacklist/disabled_providers fields."""
+    config, data = read(CONFIG_PATH), metadata()
+    adopt(data, config)
+    providers = config.get("provider", {})
+    if not isinstance(providers, dict):
+        raise ValueError("opencode.json has an invalid provider map")
+    disabled_providers = {pid for pid, item in data["providers"].items() if item.get("availability") == "disabled"}
+    old = set(data.get("applied_disabled_providers", []))
+    user_entries = set(config.get("disabled_providers", [])) - old
+    if user_entries or disabled_providers:
+        config["disabled_providers"] = sorted(user_entries | disabled_providers)
+    else:
+        config.pop("disabled_providers", None)
+    data["applied_disabled_providers"] = sorted(disabled_providers)
+    for provider_id, provider in providers.items():
+        if not isinstance(provider, dict):
+            continue
+        item = provider_meta(data, provider_id)
+        disabled_models = {mid for mid, model in item["models"].items() if model.get("availability") == "disabled"}
+        old = set(item.get("applied_disabled_models", []))
+        user_entries = set(provider.get("blacklist", [])) - old
+        if user_entries or disabled_models:
+            provider["blacklist"] = sorted(user_entries | disabled_models)
+        else:
+            provider.pop("blacklist", None)
+        item["applied_disabled_models"] = sorted(disabled_models)
+    write(CONFIG_PATH, config)
+    write(METADATA_PATH, data)
+
+
+def choose_url() -> str:
+    print("Choose your OpenAI-compatible LLM server:")
+    for key, (name, url) in PRESETS.items():
+        print(f"  {key}) {name}" + (f"  ({url})" if url else ""))
+    while True:
+        choice = prompt("Enter number or type a URL directly", "1")
+        if choice in PRESETS:
+            return PRESETS[choice][1] or prompt("Enter base URL (include /v1)", "http://localhost:8080/v1")
+        if choice.startswith(("http://", "https://")):
+            return choice.rstrip("/")
+        print("  Enter a preset number or an http(s) URL.")
+
+
+def fetch_models(url: str, credential_variable: str | None) -> list[str]:
+    headers = {"Accept": "application/json"}
+    if credential_variable and os.environ.get(credential_variable):
+        headers["Authorization"] = f"Bearer {os.environ[credential_variable]}"
+    request = urllib.request.Request(f"{url.rstrip('/')}/models", headers=headers)
+    with urllib.request.urlopen(request, timeout=5) as response:
+        payload = json.loads(response.read().decode())
+    items = payload if isinstance(payload, list) else payload.get("data", [])
+    return sorted(item.get("id", "") for item in items if item.get("id"))
+
+
+def choose_classification() -> str:
+    while True:
+        choice = prompt("Cost classification: 1) LOCAL / FREE  2) REMOTE / PAID", "1")
+        try:
+            return validate_classification({"1": LOCAL_FREE, "2": REMOTE_PAID}.get(choice, choice))
+        except ValueError:
+            print("  Choose 1 (LOCAL / FREE) or 2 (REMOTE / PAID).")
+
+
+def choose_credential() -> str | None:
+    required = prompt("Does this provider require a credential? [y/N]", "n").lower()
+    if required not in {"y", "yes"}:
+        return None
+    while True:
+        variable = prompt("Credential environment variable (value is never stored)")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", variable):
+            return variable
+        print("  Enter a valid environment variable name.")
+
+
+def wizard() -> None:
+    print("\nopencode-local — provider setup\n")
+    name = prompt("Provider display name", "Local LLM")
+    provider_id = prompt("OpenCode provider ID", re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "localllm")
+    category, url, variable = choose_classification(), choose_url(), choose_credential()
+    try:
+        models = fetch_models(url, variable)
+        print(f"Connected — {len(models)} model(s) returned.")
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, socket.timeout) as exc:
+        print(f"Could not reach server: {exc}")
+        models = []
+    for number, model in enumerate(models, 1):
+        print(f"  {number}) {model}")
+    choice = prompt("Pick model number or type model name", "1" if models else "")
+    model_id = models[int(choice) - 1] if choice.isdigit() and 1 <= int(choice) <= len(models) else choice
+    while not model_id:
+        model_id = prompt("A model name is required")
+    config = read(CONFIG_PATH, {"$schema": SCHEMA_URL})
+    config.setdefault("$schema", SCHEMA_URL)
+    provider = {"npm": "@ai-sdk/openai-compatible", "name": name, "options": {"baseURL": url}, "models": {model_id: {"name": model_id}}}
+    config.setdefault("provider", {})[provider_id] = provider
+    config["model"] = config["small_model"] = f"{provider_id}/{model_id}"
+    data = metadata()
+    item = provider_meta(data, provider_id)
+    item.update({"display_name": name, "availability": "enabled", "classification": category})
+    model_meta(data, provider_id, model_id)["availability"] = "enabled"
+    set_credential_reference(provider, item, variable)
+    write(CONFIG_PATH, config)
+    write(METADATA_PATH, data)
+    sync()
+    print(f"Wrote {CONFIG_PATH} and {METADATA_PATH}. No credentials or backups were written.")
+
+
+def tint(value: str, colour: str) -> str:
+    return f"\033[{colour}m{value}\033[0m" if sys.stdout.isatty() else value
+
+
+def status() -> None:
+    config, data = read(CONFIG_PATH), metadata()
+    if adopt(data, config):
+        write(METADATA_PATH, data)
+    groups: dict[str, list[tuple[str, dict[str, Any], dict[str, Any]]]] = {LOCAL_FREE: [], REMOTE_PAID: [], "unclassified": []}
+    for provider_id, config_provider in config.get("provider", {}).items():
+        item = provider_meta(data, provider_id)
+        groups.setdefault(item.get("classification", "unclassified"), []).append((provider_id, config_provider, item))
+    for category, heading, colour in ((LOCAL_FREE, "LOCAL / FREE", "1;32"), (REMOTE_PAID, "REMOTE / PAID", "1;33"), ("unclassified", "UNCLASSIFIED — SET EXPLICITLY", "1;37")):
+        print("\n" + tint(heading, colour))
+        if not groups[category]:
+            print("  (none)")
+        for provider_id, config_provider, item in sorted(groups[category]):
+            state = item.get("availability", "enabled").upper()
+            disabled = "2" if state == "DISABLED" else colour
+            name = item.get("display_name", config_provider.get("name", provider_id))
+            credential, variable = credential_status(item)
+            print("  " + tint(f"{name} [{provider_id}]", disabled))
+            print("    State: {0}".format(tint(state, disabled)))
+            endpoint = config_provider.get("options", {}).get("baseURL")
+            if endpoint:
+                print(f"    Endpoint: {endpoint}")
+            print(f"    Credential: {variable or 'NOT REQUIRED'}")
+            print("    Credential status: " + tint(credential, "32" if credential in {"PRESENT", "NOT REQUIRED"} else "1;33"))
+            if item.get("notes"):
+                print(f"    Notes: {item['notes']}")
+            for model_id in config_provider.get("models", {}):
+                model = model_meta(data, provider_id, model_id)
+                model_state = model.get("availability", "enabled").upper()
+                effective = " (PROVIDER DISABLED)" if state == "DISABLED" and model_state == "ENABLED" else ""
+                label = f"{model_id:<30} {model_state}{effective}{'     PAID' if category == REMOTE_PAID else ''}"
+                print("    " + tint(label, "2" if model_state == "DISABLED" or effective else colour))
+    print(f"\nMetadata: {METADATA_PATH}")
+
+
+def set_availability(target: str, availability: str) -> None:
+    provider_id, slash, model_id = target.partition("/")
+    config, data = read(CONFIG_PATH), metadata()
+    if provider_id not in config.get("provider", {}):
+        raise ValueError(f"Unknown provider: {provider_id}")
+    if slash:
+        if model_id not in config["provider"][provider_id].get("models", {}):
+            raise ValueError(f"Unknown model: {target}")
+        model_meta(data, provider_id, model_id)["availability"] = availability
+    else:
+        provider_meta(data, provider_id)["availability"] = availability
+    write(METADATA_PATH, data)
+    sync()
+    print(f"{target} is now {availability.upper()}.")
+
+
+def classify(target: str, classification: str) -> None:
+    provider_id, slash, model_id = target.partition("/")
+    config, data = read(CONFIG_PATH), metadata()
+    if provider_id not in config.get("provider", {}):
+        raise ValueError(f"Unknown provider: {provider_id}")
+    if slash:
+        if model_id not in config["provider"][provider_id].get("models", {}):
+            raise ValueError(f"Unknown model: {target}")
+        model_meta(data, provider_id, model_id)["classification"] = validate_classification(classification)
+    else:
+        provider_meta(data, provider_id)["classification"] = validate_classification(classification)
+    write(METADATA_PATH, data)
+    print(f"{target} is classified as {validate_classification(classification).upper().replace('-', ' / ')}.")
+
+
+def edit_provider(args: argparse.Namespace) -> None:
+    config, data = read(CONFIG_PATH), metadata()
+    providers = config.get("provider", {})
+    old_id, new_id = args.provider_id, args.new_id or args.provider_id
+    if old_id not in providers:
+        raise ValueError(f"Unknown provider: {old_id}")
+    if new_id != old_id and new_id in providers:
+        raise ValueError(f"Provider already exists: {new_id}")
+    if args.credential_env is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.credential_env):
+        raise ValueError("credential environment variable must be a valid variable name")
+    provider = providers.pop(old_id)
+    item = data["providers"].pop(old_id, provider_meta(data, old_id))
+    providers[new_id] = provider
+    data["providers"][new_id] = item
+    if args.name:
+        provider["name"] = args.name
+        item["display_name"] = args.name
+    if args.base_url:
+        provider.setdefault("options", {})["baseURL"] = args.base_url
+    if args.classification:
+        item["classification"] = validate_classification(args.classification)
+    if args.credential_env is not None:
+        set_credential_reference(provider, item, args.credential_env)
+    if args.no_credential:
+        set_credential_reference(provider, item, None)
+    if args.notes is not None:
+        if args.notes:
+            item["notes"] = args.notes
+        else:
+            item.pop("notes", None)
+    if args.enabled:
+        item["availability"] = "enabled"
+    if args.disabled:
+        item["availability"] = "disabled"
+    if new_id != old_id:
+        for key in ("model", "small_model"):
+            if config.get(key, "").startswith(old_id + "/"):
+                config[key] = new_id + config[key][len(old_id):]
+        data["applied_disabled_providers"] = [new_id if value == old_id else value for value in data.get("applied_disabled_providers", [])]
+        if "disabled_providers" in config:
+            config["disabled_providers"] = [new_id if value == old_id else value for value in config["disabled_providers"]]
+    write(CONFIG_PATH, config)
+    write(METADATA_PATH, data)
+    sync()
+    print(f"Updated provider {new_id}.")
 
 
 def main() -> None:
-    _print_banner()
-
-    # ── 1. Provider name ────────────────────────────────────────────────────
-    provider_name = _prompt("Provider display name", "Local LLM")
-    provider_id = _slugify(provider_name)
-
-    # ── 2. Base URL ──────────────────────────────────────────────────────────
-    base_url = _choose_base_url()
-
-    # ── 3. API key ───────────────────────────────────────────────────────────
-    print(
-        "\nMost local servers accept any placeholder key.\n"
-        "Leave blank to use the default placeholder 'sk-local'."
-    )
-    api_key = _prompt_secret("API key", "sk-local")
-
-    # ── 4. Fetch models ───────────────────────────────────────────────────────
-    print(f"\nConnecting to {base_url}/models …")
-    models: list[str] = []
+    parser = argparse.ArgumentParser(description="Configure OpenCode availability and credential references.")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("setup", help="interactively add or update a provider")
+    sub.add_parser("status", help="show provider, credential, and model status")
+    sub.add_parser("sync", help="apply availability metadata")
+    for command in ("enable", "disable"):
+        sub.add_parser(command, help=f"{command} a provider or model").add_argument("target", help="provider or provider/model")
+    classify_parser = sub.add_parser("classify", help="set explicit local/free or remote/paid classification")
+    classify_parser.add_argument("target", help="provider or provider/model")
+    classify_parser.add_argument("classification", help="local-free or remote-paid")
+    edit = sub.add_parser("edit-provider", help="edit provider metadata and OpenCode-safe settings")
+    edit.add_argument("provider_id")
+    edit.add_argument("--id", dest="new_id")
+    edit.add_argument("--name")
+    edit.add_argument("--base-url")
+    edit.add_argument("--classification")
+    edit.add_argument("--credential-env", metavar="VARIABLE")
+    edit.add_argument("--no-credential", action="store_true")
+    edit.add_argument("--notes")
+    state = edit.add_mutually_exclusive_group()
+    state.add_argument("--enabled", action="store_true")
+    state.add_argument("--disabled", action="store_true")
+    args = parser.parse_args()
     try:
-        models = _fetch_models(base_url, api_key)
-        if models:
-            print(f"  ✓ Connected — {len(models)} model(s) available.")
+        if args.command in {None, "setup"}:
+            wizard()
+        elif args.command == "status":
+            status()
+        elif args.command == "sync":
+            sync()
+            print("OpenCode availability settings synchronized.")
+        elif args.command in {"enable", "disable"}:
+            set_availability(args.target, args.command + "d")
+        elif args.command == "classify":
+            classify(args.target, args.classification)
         else:
-            print("  ✓ Connected, but no models were returned.")
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, socket.timeout) as exc:
-        print(f"  ✗ Could not reach the server: {exc}")
-        print("  You can still enter a model name manually.\n")
-
-    # ── 5. Choose model ───────────────────────────────────────────────────────
-    model_id = _select_model(models)
-    while not model_id:
-        print("  A model name is required.")
-        model_id = _prompt("Enter the model name to use", "")
-
-    # ── 6. Confirm ────────────────────────────────────────────────────────────
-    print(
-        f"\n─── Summary ───────────────────────────────────────────\n"
-        f"  Provider ID  : {provider_id}\n"
-        f"  Provider name: {provider_name}\n"
-        f"  Base URL     : {base_url}\n"
-        f"  Model        : {model_id}\n"
-        f"  Config file  : {CONFIG_PATH}\n"
-        f"  Auth file    : {AUTH_PATH}\n"
-        f"───────────────────────────────────────────────────────\n"
-    )
-    confirm = _prompt("Write these files? [Y/n]", "y").lower()
-    if confirm not in {"y", "yes"}:
-        print("Aborted — no files were written.")
-        sys.exit(0)
-
-    # ── 7. Backup + write ─────────────────────────────────────────────────────
-    print()
-    _backup_config()
-
-    opencode_data = _build_opencode_json(provider_id, provider_name, base_url, model_id)
-    _write_json(CONFIG_PATH, opencode_data)
-    print(f"  Wrote {CONFIG_PATH}")
-
-    existing_auth: dict = {}
-    if AUTH_PATH.exists():
-        try:
-            existing_auth = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            pass
-    auth_data = _build_auth_json(existing_auth, provider_id, api_key)
-    _write_json(AUTH_PATH, auth_data)
-    print(f"  Wrote {AUTH_PATH}")
-
-    print(
-        "\n✓ Done!  You can now run opencode and it will use your local LLM.\n"
-        "  To change settings later just re-run this script or edit the\n"
-        f"  config file directly at {CONFIG_PATH}\n"
-    )
+            edit_provider(args)
+    except ValueError as exc:
+        sys.exit(f"Error: {exc}")
 
 
 if __name__ == "__main__":
