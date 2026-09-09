@@ -127,6 +127,26 @@ def adopt(data: dict[str, Any], config: dict[str, Any]) -> bool:
     return changed
 
 
+def has_meaningful_configuration(config: dict[str, Any]) -> bool:
+    """Conservatively decide whether OpenCode already has user configuration."""
+    for key in ("provider", "providers"):
+        providers = config.get(key)
+        if isinstance(providers, dict) and providers:
+            return True
+    return bool(config.get("model") or config.get("small_model"))
+
+
+def startup_flow() -> str:
+    """Return the startup flow without creating or changing any files."""
+    if not CONFIG_PATH.exists():
+        return "fresh"
+    try:
+        return "existing" if has_meaningful_configuration(read(CONFIG_PATH)) else "fresh"
+    except ValueError:
+        # A config we cannot confidently classify is not a fresh configuration.
+        return "existing"
+
+
 def sync() -> None:
     """Apply metadata with documented OpenCode blacklist/disabled_providers fields."""
     config, data = read(CONFIG_PATH), metadata()
@@ -202,11 +222,16 @@ def choose_credential() -> str | None:
         print("  Enter a valid environment variable name.")
 
 
-def wizard() -> None:
+def wizard(initial_category: str | None = None) -> None:
     print("\nopencode-local — provider setup\n")
     name = prompt("Provider display name", "Local LLM")
     provider_id = prompt("OpenCode provider ID", re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "localllm")
-    category, url, variable = choose_classification(), choose_url(), choose_credential()
+    config = read(CONFIG_PATH, {"$schema": SCHEMA_URL})
+    configuring_first_provider = not has_meaningful_configuration(config)
+    if provider_id in config.get("provider", {}):
+        print(f"Provider '{provider_id}' already exists. Use Edit provider or choose a different provider ID.")
+        return
+    category, url, variable = initial_category or choose_classification(), choose_url(), choose_credential()
     try:
         models = fetch_models(url, variable)
         print(f"Connected — {len(models)} model(s) returned.")
@@ -219,11 +244,20 @@ def wizard() -> None:
     model_id = models[int(choice) - 1] if choice.isdigit() and 1 <= int(choice) <= len(models) else choice
     while not model_id:
         model_id = prompt("A model name is required")
-    config = read(CONFIG_PATH, {"$schema": SCHEMA_URL})
     config.setdefault("$schema", SCHEMA_URL)
     provider = {"npm": "@ai-sdk/openai-compatible", "name": name, "options": {"baseURL": url}, "models": {model_id: {"name": model_id}}}
+    print("\nSummary")
+    print(f"  Provider: {name} [{provider_id}]")
+    print(f"  Category: {category.upper().replace('-', ' / ')}")
+    print(f"  Endpoint: {url}")
+    print(f"  Model: {model_id}")
+    print(f"  Credential: {variable or 'NOT REQUIRED'}")
+    if prompt("Save this provider? [Y/n]", "y").lower() not in {"y", "yes"}:
+        print("Nothing was written.")
+        return
     config.setdefault("provider", {})[provider_id] = provider
-    config["model"] = config["small_model"] = f"{provider_id}/{model_id}"
+    if configuring_first_provider:
+        config["model"] = config["small_model"] = f"{provider_id}/{model_id}"
     data = metadata()
     item = provider_meta(data, provider_id)
     item.update({"display_name": name, "availability": "enabled", "classification": category})
@@ -239,9 +273,9 @@ def tint(value: str, colour: str) -> str:
     return f"\033[{colour}m{value}\033[0m" if sys.stdout.isatty() else value
 
 
-def status() -> None:
+def status(read_only: bool = False) -> None:
     config, data = read(CONFIG_PATH), metadata()
-    if adopt(data, config):
+    if adopt(data, config) and not read_only:
         write(METADATA_PATH, data)
     groups: dict[str, list[tuple[str, dict[str, Any], dict[str, Any]]]] = {LOCAL_FREE: [], REMOTE_PAID: [], "unclassified": []}
     for provider_id, config_provider in config.get("provider", {}).items():
@@ -352,10 +386,117 @@ def edit_provider(args: argparse.Namespace) -> None:
     print(f"Updated provider {new_id}.")
 
 
+def choose_provider_kind() -> str | None:
+    print("\n1) Local / free model server\n2) Remote / paid API provider\nq) Cancel")
+    while True:
+        choice = prompt("Choose provider type", "q").lower()
+        if choice == "1":
+            return LOCAL_FREE
+        if choice == "2":
+            return REMOTE_PAID
+        if choice in {"q", "quit"}:
+            return None
+        print("  Choose 1, 2, or q.")
+
+
+def interactive_edit_provider() -> None:
+    provider_id = prompt("Provider ID to edit")
+    if not provider_id:
+        return
+    print("Leave fields blank to keep their current value.")
+    credential = prompt("Credential environment variable (or '-' for not required)")
+    notes = prompt("Notes")
+    args = argparse.Namespace(
+        provider_id=provider_id,
+        new_id=prompt("New provider ID"),
+        name=prompt("Display name"),
+        base_url=prompt("Base URL"),
+        classification=prompt("Classification (local-free/remote-paid)"),
+        credential_env=credential or None,
+        no_credential=credential == "-",
+        notes=notes or None,
+        enabled=False,
+        disabled=False,
+    )
+    if credential == "-":
+        args.credential_env = None
+    edit_provider(args)
+
+
+def inventory_summary() -> None:
+    """Print the short, read-only inventory intended for the home screen."""
+    config, data = read(CONFIG_PATH), metadata()
+    groups: dict[str, list[tuple[str, dict[str, Any], dict[str, Any]]]] = {LOCAL_FREE: [], REMOTE_PAID: [], "unclassified": []}
+    for provider_id, config_provider in config.get("provider", {}).items():
+        item = provider_meta(data, provider_id)
+        groups.setdefault(item.get("classification", "unclassified"), []).append((provider_id, config_provider, item))
+    for category, heading, colour in (
+        (LOCAL_FREE, "LOCAL / FREE", "1;32"),
+        (REMOTE_PAID, "REMOTE / PAID", "1;33"),
+        ("unclassified", "UNCLASSIFIED — SET EXPLICITLY", "1;37"),
+    ):
+        entries = groups[category]
+        if not entries:
+            continue
+        print(tint(heading, colour))
+        for provider_id, config_provider, item in sorted(entries):
+            name = item.get("display_name", config_provider.get("name", provider_id))
+            model_count = len(config_provider.get("models", {}))
+            disabled_models = sum(
+                model.get("availability") == "disabled" for model in item.get("models", {}).values()
+            )
+            state = item.get("availability", "enabled").upper()
+            suffix = f"{model_count} model{'s' if model_count != 1 else ''}"
+            if disabled_models:
+                suffix += f", {disabled_models} disabled"
+            if state == "DISABLED":
+                suffix += ", provider disabled"
+            print("  " + tint(f"{name:<28} {suffix}", "2" if state == "DISABLED" else colour))
+        print()
+
+
+def home() -> None:
+    """Interactive, state-aware entry point. Reading this screen never writes."""
+    print("\nopencode-local\n")
+    if startup_flow() == "fresh":
+        print("No existing OpenCode provider configuration was found.\n\nLet's set up your first provider.")
+        kind = choose_provider_kind()
+        if kind:
+            wizard(kind)
+        return
+
+    print("Existing OpenCode configuration found.\n")
+    inventory_summary()
+    print("What do you want to do?\n\n1) View provider details\n2) Add provider\n3) Edit provider\n4) Enable / disable provider or model\n5) Sync\nq) Quit")
+    choice = prompt("Choose an action", "q").lower()
+    if choice in {"q", "quit"}:
+        return
+    if choice == "1":
+        status(read_only=True)
+    elif choice == "2":
+        kind = choose_provider_kind()
+        if kind:
+            wizard(kind)
+    elif choice == "3":
+        interactive_edit_provider()
+    elif choice == "4":
+        target = prompt("Provider or provider/model")
+        action = prompt("Enable or disable", "disable").lower()
+        if action not in {"enable", "disable"}:
+            print("No change made; enter enable or disable.")
+        else:
+            set_availability(target, action + "d")
+    elif choice == "5":
+        sync()
+        print("OpenCode availability settings synchronized.")
+    else:
+        print("No change made; choose an item from the menu.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Configure OpenCode availability and credential references.")
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("setup", help="interactively add or update a provider")
+    sub.add_parser("setup", help="interactively add a provider")
     sub.add_parser("status", help="show provider, credential, and model status")
     sub.add_parser("sync", help="apply availability metadata")
     for command in ("enable", "disable"):
@@ -377,8 +518,12 @@ def main() -> None:
     state.add_argument("--disabled", action="store_true")
     args = parser.parse_args()
     try:
-        if args.command in {None, "setup"}:
-            wizard()
+        if args.command is None:
+            home()
+        elif args.command == "setup":
+            kind = choose_provider_kind()
+            if kind:
+                wizard(kind)
         elif args.command == "status":
             status()
         elif args.command == "sync":

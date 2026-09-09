@@ -4,6 +4,20 @@
 and making model availability deliberate. It has no web UI and needs only
 Python's standard library.
 
+## Starting the app
+
+Run `./launch.sh` or `python3 setup.py`. Startup first inspects
+`opencode.json` without changing it. With no meaningful provider/model
+configuration, it offers guided first-provider onboarding. With any existing
+provider or model configuration, it opens a control panel with a compact
+LOCAL / FREE, REMOTE / PAID, and unclassified provider/model-count inventory
+before asking what to do. Endpoint and credential diagnostics are available
+only through **View provider details** or `python3 setup.py status`.
+
+The home screen is read-only until you explicitly select an action. Adding a
+provider refuses to replace an existing provider ID; use **Edit provider** or
+choose another ID instead.
+
 ## Security model
 
 **opencode-local manages credential references, not credentials.** It never

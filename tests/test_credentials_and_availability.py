@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).parents[1] / "setup.py"
@@ -92,3 +93,62 @@ class CredentialAndAvailabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartupFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.config_dir = Path(self.tempdir.name) / "config"
+        setup.CONFIG_DIR = self.config_dir
+        setup.CONFIG_PATH = self.config_dir / "opencode.json"
+        setup.METADATA_PATH = self.config_dir / "opencode-local.json"
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def write_config(self, data):
+        setup.write(setup.CONFIG_PATH, data)
+
+    def test_missing_or_empty_config_uses_fresh_onboarding(self):
+        self.assertEqual("fresh", setup.startup_flow())
+        self.write_config({"$schema": setup.SCHEMA_URL})
+        self.assertEqual("fresh", setup.startup_flow())
+
+    def test_provider_or_model_configuration_uses_existing_control_panel(self):
+        self.write_config({"provider": {"existing": {}}})
+        self.assertEqual("existing", setup.startup_flow())
+        self.write_config({"provider": {"existing": {"models": {"model": {}}}}})
+        self.assertEqual("existing", setup.startup_flow())
+        self.write_config({"model": "existing/model"})
+        self.assertEqual("existing", setup.startup_flow())
+
+    def test_add_collision_does_not_overwrite_existing_provider(self):
+        original = {"provider": {"existing": {"name": "Preserve me", "unknown_field": {"keep": True}, "models": {"old": {}}}}}
+        self.write_config(original)
+        before = setup.CONFIG_PATH.read_text()
+        with patch.object(setup, "prompt", side_effect=["Replacement", "existing"]):
+            setup.wizard(setup.LOCAL_FREE)
+        self.assertEqual(before, setup.CONFIG_PATH.read_text())
+        self.assertFalse(setup.METADATA_PATH.exists())
+
+    def test_home_screen_is_read_only_until_an_action_is_selected(self):
+        self.write_config({"provider": {"existing": {"name": "Existing", "models": {"model": {}}}}})
+        setup.write(setup.METADATA_PATH, {"version": 1, "providers": {"existing": {"classification": "local-free", "availability": "enabled", "models": {}}}})
+        config_before = setup.CONFIG_PATH.read_text()
+        metadata_before = setup.METADATA_PATH.read_text()
+        output = io.StringIO()
+        with patch.object(setup, "prompt", return_value="q"), redirect_stdout(output):
+            setup.home()
+        self.assertEqual(config_before, setup.CONFIG_PATH.read_text())
+        self.assertEqual(metadata_before, setup.METADATA_PATH.read_text())
+        self.assertIn("Existing OpenCode configuration found", output.getvalue())
+        self.assertIn("Existing", output.getvalue())
+        self.assertNotIn("Endpoint:", output.getvalue())
+        self.assertNotIn("Credential status:", output.getvalue())
+
+    def test_existing_direct_enable_disable_command_functions_still_work(self):
+        self.write_config({"provider": {"existing": {"models": {"model": {}}}}})
+        setup.set_availability("existing/model", "disabled")
+        self.assertEqual(["model"], setup.read(setup.CONFIG_PATH)["provider"]["existing"]["blacklist"])
+        setup.set_availability("existing/model", "enabled")
+        self.assertNotIn("blacklist", setup.read(setup.CONFIG_PATH)["provider"]["existing"])
